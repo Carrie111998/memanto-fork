@@ -63,8 +63,8 @@ API_KEY_ENV = "MOORCHEH_API_KEY"
 
 _TITLE_MAX = 100
 _MAX_RECALL = 100  # InputLimits.MAX_K
-# ConversationMemoryExtractionService rejects more than 200 messages.
-_MAX_EXTRACT_MESSAGES = 200
+_MAX_BATCH = 100  # batch_remember's limit
+_MAX_EXTRACT = ConversationMemoryExtractionService.MAX_MEMORIES
 # Newest rows read back to find a session's retained markers. Rows from one
 # batch share a marker, so a handful covers the latest batch.
 _MARKER_LOOKBACK = 20
@@ -151,6 +151,10 @@ class MemantoMemoryService(BaseMemoryService):
             raise ValueError(f"api_key is required (or set ${API_KEY_ENV})")
         if not 1 <= recall_limit <= _MAX_RECALL:
             raise ValueError(f"recall_limit must be between 1 and {_MAX_RECALL}")
+        if not 1 <= extract_max_memories <= _MAX_EXTRACT:
+            raise ValueError(
+                f"extract_max_memories must be between 1 and {_MAX_EXTRACT}"
+            )
         self._api_key = api_key
         self._agent_id = agent_id
         self._recall_limit = recall_limit
@@ -233,13 +237,15 @@ class MemantoMemoryService(BaseMemoryService):
         events: list[Event],
         session_id: str | None,
     ) -> None:
-        if not events:
+        messages = _messages(events)
+        if not messages:
             return
         agent = self._agent(app_name)
         tag = user_tag(user_id)
-        marker = self._marker(tag, events[-1].id)
+        last_event_id = messages[-1][0]
+        marker = self._marker(tag, last_event_id)
         if marker in self._markers(agent, marker):
-            logger.info("Events up to %s were already stored; skipping", events[-1].id)
+            logger.info("Events up to %s were already stored; skipping", last_event_id)
             return
         session_tag = self._session_tag(tag, session_id) if session_id else None
         self._retain(agent, tag, session_tag, events)
@@ -251,31 +257,52 @@ class MemantoMemoryService(BaseMemoryService):
         session_tag: str | None,
         events: list[Event],
     ) -> None:
-        conversation = _conversation(events)
-        if not any(m["role"] == "user" for m in conversation):
-            return
+        """Extract and store *events* in chunks the extractor accepts whole.
+
+        The extractor silently drops text past its character budget, so a long
+        backlog is split rather than truncated. Each chunk is stored with the
+        marker of its own last event, so a failure part-way through resumes
+        from the last chunk that was stored.
+        """
         extractor = ConversationMemoryExtractionService(agent.client._get_moorcheh())
-        try:
-            candidates = extractor.extract(
-                namespace="",  # extraction runs the raw LLM; no namespace is read
-                messages=conversation,
-                max_memories=self._extract_max_memories,
-            )
-        except ValueError as exc:
-            # Raised both when the turn held nothing worth keeping and when the
-            # LLM output was unusable; the two are indistinguishable here.
-            logger.info("Memory extraction returned nothing: %s", exc)
-            return
-        tags = [tag, SOURCE, self._marker(tag, events[-1].id)]
-        if session_tag:
-            tags.insert(1, session_tag)
-        items = [{**c, "tags": tags, "source": SOURCE} for c in candidates]
-        if items:
-            agent.run(
-                lambda client: client.batch_remember(
-                    agent_id=agent.agent_id, memories=items
+        for chunk in _chunks(_messages(events)):
+            conversation = [message for _, message in chunk]
+            if not any(m["role"] == "user" for m in conversation):
+                continue
+            try:
+                candidates = extractor.extract(
+                    namespace="",  # extraction runs the raw LLM; no namespace is read
+                    messages=conversation,
+                    max_memories=self._extract_max_memories,
                 )
+            except ValueError as exc:
+                # Raised both when the turn held nothing worth keeping and when
+                # the LLM output was unusable; the two are indistinguishable here.
+                logger.info("Memory extraction returned nothing: %s", exc)
+                continue
+            tags = [tag, SOURCE, self._marker(tag, chunk[-1][0])]
+            if session_tag:
+                tags.insert(1, session_tag)
+            self._store(
+                agent, [{**c, "tags": tags, "source": SOURCE} for c in candidates]
             )
+
+    def _store(self, agent: _Agent, items: list[dict[str, Any]]) -> None:
+        """batch_remember in slices of its 100-item limit; log rejected items."""
+        for start in range(0, len(items), _MAX_BATCH):
+            batch = items[start : start + _MAX_BATCH]
+
+            def remember(client: SdkClient, batch: list[dict[str, Any]] = batch) -> Any:
+                return client.batch_remember(agent_id=agent.agent_id, memories=batch)
+
+            result = agent.run(remember)
+            # batch_remember reports per-item rejections instead of raising.
+            for row in result.get("results") or []:
+                if row.get("status") == "failed":
+                    logger.warning(
+                        "Memanto rejected a memory: %s",
+                        row.get("error") or row.get("reason"),
+                    )
 
     def _add_memory(
         self, app_name: str, user_id: str, memories: list[MemoryEntry]
@@ -302,20 +329,16 @@ class MemantoMemoryService(BaseMemoryService):
                     "provenance": "explicit_statement",
                 }
             )
-        if not items:
-            return
-        agent = self._agent(app_name)
-        agent.run(
-            lambda client: client.batch_remember(
-                agent_id=agent.agent_id, memories=items
-            )
-        )
+        if items:
+            self._store(self._agent(app_name), items)
 
     # ------------------------------------------------------------------ #
     # Reads
     # ------------------------------------------------------------------ #
 
     def _search(self, app_name: str, user_id: str, query: str) -> SearchMemoryResponse:
+        if not query.strip():
+            return SearchMemoryResponse()
         agent = self._agent(app_name)
         tag = user_tag(user_id)
         result = agent.run(
@@ -376,16 +399,40 @@ def _text(content: types.Content | None) -> str:
     return "\n".join(p.text for p in content.parts if p.text and not p.thought).strip()
 
 
-def _conversation(events: list[Event]) -> list[dict[str, str]]:
-    """User and agent text from *events*, newest last; tool calls are skipped."""
+def _messages(events: list[Event]) -> list[tuple[str, dict[str, str]]]:
+    """(event id, message) for user and agent text; tool calls are skipped."""
     messages = []
     for event in events:
         text = _text(event.content)
         if event.partial or not text:
             continue
         role = "user" if event.author == "user" else "assistant"
-        messages.append({"role": role, "content": text})
-    return messages[-_MAX_EXTRACT_MESSAGES:]
+        messages.append((event.id, {"role": role, "content": text}))
+    return messages
+
+
+def _chunks(
+    messages: list[tuple[str, dict[str, str]]],
+) -> list[list[tuple[str, dict[str, str]]]]:
+    """Split *messages* to fit the extractor's message and character limits."""
+    limits = ConversationMemoryExtractionService
+    chunks: list[list[tuple[str, dict[str, str]]]] = []
+    current: list[tuple[str, dict[str, str]]] = []
+    size = 0
+    for item in messages:
+        # The extractor renders each message as "role: content" plus a newline.
+        length = len(item[1]["role"]) + len(item[1]["content"]) + 3
+        if current and (
+            len(current) >= limits.MAX_MESSAGES
+            or size + length > limits.MAX_CONTENT_CHARS
+        ):
+            chunks.append(current)
+            current, size = [], 0
+        current.append(item)
+        size += length
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _entry(memory: dict[str, Any]) -> MemoryEntry:

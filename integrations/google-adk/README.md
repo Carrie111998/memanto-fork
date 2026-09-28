@@ -22,6 +22,8 @@ export MOORCHEH_API_KEY=...   # Memanto / Moorcheh key
 ## Use it
 
 ```python
+import logging
+
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -30,8 +32,13 @@ from memanto_google_adk import MemantoMemoryService, remember_tool
 
 
 async def save_to_memory(callback_context):
-    # Store what is new in this session after every agent turn.
-    await callback_context.add_session_to_memory()
+    # Store what is new in this session after every agent turn. If Memanto is
+    # unreachable, log it rather than fail the user's turn: the next
+    # successful save picks up the turns this one missed.
+    try:
+        await callback_context.add_session_to_memory()
+    except Exception:
+        logging.exception("Saving to Memanto failed")
 
 
 agent = LlmAgent(
@@ -56,19 +63,23 @@ runner = Runner(
 
 ### With `adk web` / `adk run`
 
-Register the `memanto://` scheme in a `services.py` next to your agent:
+Register the `memanto://` scheme in a `services.py`:
 
 ```python
-# my_agent/services.py
 from google.adk.cli.service_registry import get_service_registry
 from memanto_google_adk import MemantoMemoryService
 
 get_service_registry().register_memory_service("memanto", MemantoMemoryService.from_uri)
 ```
 
-```bash
-adk web --memory_service_uri memanto://
-```
+Where ADK looks for it depends on the command:
+
+| Command | `services.py` goes in |
+|---|---|
+| `adk web --memory_service_uri memanto:// <agents_dir>` (also `adk api_server`) | `<agents_dir>/services.py`, the folder that contains your agent folders |
+| `adk run --memory_service_uri memanto:// <agents_dir>/my_agent` | `<agents_dir>/my_agent/services.py` |
+
+A `services.py` in the wrong folder fails at startup with `Unsupported memory service URI: memanto:`. Set `MOORCHEH_API_KEY` in the environment before starting.
 
 `memanto://my-agent` uses the Memanto agent `my-agent` for every app, instead of one per app.
 

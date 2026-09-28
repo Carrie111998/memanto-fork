@@ -1,3 +1,4 @@
+import logging
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -39,6 +40,7 @@ class FakeBackend:
         self.memories: list[dict[str, Any]] = []
         self.ignore_tag_filter = False
         self.session_errors = 0
+        self.reject_content: str | None = None
         self.extractions: list[list[dict[str, str]]] = []
         self.extracted: list[dict[str, Any]] = [
             {
@@ -94,8 +96,14 @@ class FakeClient:
         self, agent_id: str, memories: list[dict[str, Any]]
     ) -> dict[str, Any]:
         self._check_session()
+        if len(memories) > 100:
+            raise ValueError("Batch size exceeds maximum of 100")
         self._record("batch_remember", agent_id=agent_id, memories=memories)
+        results = []
         for memory in memories:
+            if memory["content"] == self.backend.reject_content:
+                results.append({"status": "failed", "error": "rejected by backend"})
+                continue
             self.backend.memories.append(
                 {
                     **memory,
@@ -104,7 +112,8 @@ class FakeClient:
                     "created_at": "2026-09-25T10:00:00Z",
                 }
             )
-        return {"successful": len(memories)}
+            results.append({"status": "stored"})
+        return {"successful": len(memories), "results": results}
 
     def recall(self, agent_id: str, query: str, **kwargs: Any) -> dict[str, Any]:
         self._check_session()
@@ -378,6 +387,104 @@ async def test_add_memory_stores_typed_entries(
         )
 
 
+async def test_long_backlog_is_chunked_not_truncated(
+    backend: FakeBackend, service: MemantoMemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    limits = memory_module.ConversationMemoryExtractionService
+    monkeypatch.setattr(limits, "MAX_CONTENT_CHARS", 60)
+    events = [_event("user", f"fact number {i} " + "x" * 20) for i in range(6)]
+    _, session = await _session("alice", *events)
+
+    await service.add_session_to_memory(session)
+
+    # Every message reached the extractor, none past its character budget.
+    extracted = [m["content"] for chunk in backend.extractions for m in chunk]
+    assert extracted == [e.content.parts[0].text for e in events]
+    assert all(
+        sum(len(m["role"]) + len(m["content"]) + 3 for m in chunk) <= 60
+        for chunk in backend.extractions
+    )
+    assert len(backend.extractions) > 1
+    # Nothing is re-extracted on the next save.
+    count = len(backend.extractions)
+    await service.add_session_to_memory(session)
+    assert len(backend.extractions) == count
+
+
+async def test_chunk_failure_resumes_from_last_stored_chunk(
+    backend: FakeBackend, service: MemantoMemoryService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    limits = memory_module.ConversationMemoryExtractionService
+    monkeypatch.setattr(limits, "MAX_MESSAGES", 2)
+    events = [_event("user", f"turn {i}") for i in range(4)]
+    _, session = await _session("alice", *events)
+
+    calls = 0
+
+    def flaky_store(self: Any, agent: Any, items: list) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ConnectionError("network down")
+        original_store(self, agent, items)
+
+    original_store = MemantoMemoryService._store
+    monkeypatch.setattr(MemantoMemoryService, "_store", flaky_store)
+    with pytest.raises(ConnectionError):
+        await service.add_session_to_memory(session)
+
+    monkeypatch.setattr(MemantoMemoryService, "_store", original_store)
+    backend.extractions.clear()
+    await service.add_session_to_memory(session)
+    assert backend.extractions == [
+        [{"role": "user", "content": "turn 2"}, {"role": "user", "content": "turn 3"}]
+    ]
+
+
+async def test_add_memory_slices_large_batches(
+    backend: FakeBackend, service: MemantoMemoryService
+) -> None:
+    entries = [
+        MemoryEntry(content=types.Content(parts=[types.Part.from_text(text=f"n{i}")]))
+        for i in range(250)
+    ]
+    await service.add_memory(app_name=APP, user_id="alice", memories=entries)
+    sizes = [len(kw["memories"]) for n, kw in backend.calls if n == "batch_remember"]
+    assert sizes == [100, 100, 50]
+    assert len(backend.memories) == 250
+
+
+async def test_rejected_items_are_logged(
+    backend: FakeBackend,
+    service: MemantoMemoryService,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    backend.reject_content = "bad"
+    await service.add_memory(
+        app_name=APP,
+        user_id="alice",
+        memories=[
+            MemoryEntry(content=types.Content(parts=[types.Part.from_text(text="bad")]))
+        ],
+    )
+    assert "rejected by backend" in caplog.text
+
+
+async def test_empty_query_returns_nothing_without_calling_memanto(
+    backend: FakeBackend, service: MemantoMemoryService
+) -> None:
+    result = await service.search_memory(app_name=APP, user_id="alice", query="  ")
+    assert result.memories == []
+    assert backend.calls == []
+
+
+def test_rejects_out_of_range_settings() -> None:
+    with pytest.raises(ValueError, match="recall_limit"):
+        MemantoMemoryService(api_key="k", recall_limit=0)
+    with pytest.raises(ValueError, match="extract_max_memories"):
+        MemantoMemoryService(api_key="k", extract_max_memories=101)
+
+
 # ---------------------------------------------------------------------- #
 # End to end through a real ADK Runner
 # ---------------------------------------------------------------------- #
@@ -458,3 +565,56 @@ async def test_runner_remembers_then_preloads_in_a_new_session(
     # Another user of the same app sees none of it.
     result = await service.search_memory(app_name=APP, user_id="bob", query="diet")
     assert result.memories == []
+
+
+async def test_readme_callback_survives_outage_and_catches_up(
+    backend: FakeBackend, service: MemantoMemoryService
+) -> None:
+    """The after_agent_callback exactly as the README shows it."""
+
+    async def save_to_memory(callback_context):
+        try:
+            await callback_context.add_session_to_memory()
+        except Exception:
+            logging.exception("Saving to Memanto failed")
+
+    llm = ScriptedLlm(
+        script=[
+            _model_says(types.Part.from_text(text="Window seat, noted.")),
+            _model_says(types.Part.from_text(text="Lisbon it is.")),
+        ],
+        requests=[],
+    )
+    agent = LlmAgent(
+        name="travel_agent",
+        model=llm,
+        tools=[preload_memory],
+        after_agent_callback=save_to_memory,
+    )
+    sessions = InMemorySessionService()
+    runner = Runner(
+        app_name=APP, agent=agent, session_service=sessions, memory_service=service
+    )
+    session = await sessions.create_session(app_name=APP, user_id="alice")
+
+    # Memanto is down for the first turn: the user still gets their answer.
+    backend.session_errors = 99
+    await _run(runner, "alice", session.id, "I always want a window seat.")
+    assert backend.extractions == []
+    # Back up: the second save also covers the turn the first one missed.
+    backend.session_errors = 0
+    await _run(runner, "alice", session.id, "Book me to Lisbon.")
+
+    assert backend.extractions == [
+        [
+            {"role": "user", "content": "I always want a window seat."},
+            {"role": "assistant", "content": "Window seat, noted."},
+            {"role": "user", "content": "Book me to Lisbon."},
+            {"role": "assistant", "content": "Lisbon it is."},
+        ],
+    ]
+    # And nothing twice on the next save.
+    await service.add_session_to_memory(
+        await sessions.get_session(app_name=APP, user_id="alice", session_id=session.id)
+    )
+    assert len(backend.extractions) == 1
