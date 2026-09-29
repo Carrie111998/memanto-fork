@@ -23,21 +23,39 @@ export interface CreateMemantoEveToolsOptions {
 /**
  * Build eve tools backed by a {@link Memanto} client.
  *
- * eve discovers one tool per file under `agent/tools/`, so re-export a
- * single tool from each file rather than the whole map:
+ * eve discovers one tool per file under `agent/tools/` and names it after the
+ * file. Create the client once in a shared module — a Memanto agent holds a
+ * single active session, so separate clients per tool file would each spawn a
+ * server and keep invalidating each other's session:
  *
  * ```ts
- * // agent/tools/recall-memory.ts
+ * // agent/lib/memanto.ts
  * import { Memanto } from "@moorcheh-ai/memanto";
  * import { createMemantoEveTools } from "@moorcheh-ai/memanto/eve";
  *
- * const memanto = new Memanto({ agentId: "my-agent" });
+ * const memanto = new Memanto({
+ *   agentId: "my-agent",
+ *   apiKey: process.env.MOORCHEH_API_KEY,
+ * });
  *
- * export default createMemantoEveTools(memanto).recallMemory;
+ * export const memantoTools = createMemantoEveTools(memanto);
  * ```
  *
- * Repeat for `agent/tools/remember-memory.ts` (`.rememberMemory`) and
- * `agent/tools/answer-memory.ts` (`.answerMemory`).
+ * Then re-export one tool per file, named to match the tool so the model sees
+ * the same names the tool descriptions use:
+ *
+ * ```ts
+ * // agent/tools/recallMemory.ts
+ * import { memantoTools } from "../lib/memanto";
+ *
+ * export default memantoTools.recallMemory;
+ * ```
+ *
+ * Repeat for `agent/tools/rememberMemory.ts` and `agent/tools/answerMemory.ts`.
+ *
+ * The client spawns a local Memanto server with `uvx`. On hosts without `uvx`
+ * (serverless deployments such as Vercel), pass `baseUrl` pointing at a
+ * running Memanto server instead.
  *
  * `eve` and `zod` are optional peer dependencies — install them in the host
  * project (eve projects already depend on both).
@@ -47,6 +65,17 @@ export function createMemantoEveTools(
   options: CreateMemantoEveToolsOptions = {},
 ) {
   const { include, defaultLimit } = options;
+
+  // A configured default bypasses the Zod input schemas below because it is
+  // applied only after eve has validated the model's arguments. Keep it inside
+  // the stricter recallMemory contract so an omitted model limit cannot
+  // silently send an invalid value to the Memanto API.
+  if (
+    defaultLimit !== undefined &&
+    (!Number.isInteger(defaultLimit) || defaultLimit < 1 || defaultLimit > 50)
+  ) {
+    throw new RangeError("defaultLimit must be an integer between 1 and 50");
+  }
 
   const all = {
     recallMemory: defineTool({

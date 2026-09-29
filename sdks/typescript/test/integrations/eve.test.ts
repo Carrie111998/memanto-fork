@@ -80,6 +80,17 @@ describe("createMemantoEveTools", () => {
     });
   });
 
+  it.each([0, -1, 1.5, 51, Number.NaN])(
+    "rejects invalid defaultLimit %s before creating tools",
+    (defaultLimit) => {
+      expect(() =>
+        createMemantoEveTools(fakeMemanto() as unknown as Memanto, {
+          defaultLimit,
+        }),
+      ).toThrow("defaultLimit must be an integer between 1 and 50");
+    },
+  );
+
   it("exposes the server memory-type contract", () => {
     expect(MEMORY_TYPES).toContain("fact");
     expect(MEMORY_TYPES).toContain("preference");
