@@ -71,7 +71,6 @@
   },
   "peerDependencies": {
     "@mastra/core": ">=1.0.0",
-    "@voltagent/core": ">=2.0.0",
     "ai": ">=5.0.0",
     "eve": ">=0.60.0",
     "openai": ">=4.55.0",
@@ -79,9 +78,6 @@
   },
   "peerDependenciesMeta": {
     "@mastra/core": {
-      "optional": true
-    },
-    "@voltagent/core": {
       "optional": true
     },
     "ai": {
