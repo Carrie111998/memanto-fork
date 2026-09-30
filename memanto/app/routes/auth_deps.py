@@ -108,8 +108,18 @@ def _origin_is_allowed(request: Request) -> bool:
         return True  # non-browser caller (CLI, curl, SDK) or mock/test request
     from memanto.app.config import settings
 
+    origin_stripped = origin.rstrip("/")
     allowed = [o.rstrip("/") for o in settings.ALLOWED_ORIGINS]
-    return origin.rstrip("/") in allowed
+    
+    if origin_stripped in allowed:
+        return True
+        
+    if settings.CORS_ORIGIN_REGEX:
+        import re
+        if re.match(settings.CORS_ORIGIN_REGEX, origin_stripped):
+            return True
+            
+    return False
 
 
 def _require_allowed_origin(request: Request) -> None:
