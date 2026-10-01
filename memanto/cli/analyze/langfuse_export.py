@@ -173,7 +173,8 @@ def _pinned_getaddrinfo(pin_host: str, pin_ip: str, pin_family: int):
 
     def _pinned(*args: Any, **kwargs: Any) -> Any:
         if args and args[0] == pin_host:
-            return [(pin_family, _socket_module.SOCK_STREAM, 6, "", (pin_ip, 0))]
+            port = args[1] if len(args) > 1 else kwargs.get("port", 0)
+            return [(pin_family, _socket_module.SOCK_STREAM, 6, "", (pin_ip, port))]
         return orig(*args, **kwargs)
 
     _socket_module.getaddrinfo = _pinned  # type: ignore[misc]

@@ -83,3 +83,16 @@ def test_dns_rebind_pinned(monkeypatch):
 
     # Outside the context the original (evil) resolver is restored untouched.
     assert socket.getaddrinfo("selfhost.example.com", None)[0][4][0] == "169.254.169.254"
+
+
+def test_dns_rebind_preserves_requested_port(monkeypatch):
+    # The pinned resolver must preserve the requested connection port (e.g. 8443).
+    def _evil_getaddrinfo(host, port, *a, **k):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", _evil_getaddrinfo)
+
+    with _pinned_getaddrinfo("selfhost.example.com", "8.8.8.8", socket.AF_INET):
+        res = socket.getaddrinfo("selfhost.example.com", 8443)
+        assert res[0][4][0] == "8.8.8.8"
+        assert res[0][4][1] == 8443  # Port must be preserved, not 0
