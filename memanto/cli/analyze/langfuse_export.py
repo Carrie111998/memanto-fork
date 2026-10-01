@@ -118,6 +118,7 @@ def _resolve_public_ip(host: str) -> str | None:
                 or ip.is_link_local
                 or ip.is_reserved
                 or ip.is_multicast
+                or (ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10"))
             ):
                 continue  # skip internal addresses, but keep looking for a public one
             return addr
