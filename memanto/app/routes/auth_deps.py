@@ -10,6 +10,7 @@ from fastapi import Cookie, Header, HTTPException, Request, Response
 
 from memanto.app.models.session import Session
 from memanto.app.services.session_service import get_session_service
+from memanto.app.utils.client_identity import set_memanto_session
 from memanto.app.utils.errors import (
     InvalidSessionTokenError,
     SessionExpiredError,
@@ -87,6 +88,47 @@ def _extract_presented_credential(
         if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
             return parts[1].strip()
     return None
+
+
+def _origin_is_allowed(request: Request) -> bool:
+    """Reject management requests carrying a non-whitelisted Origin header.
+
+    The loopback trust in require_management_access is only safe when the
+    browser-side origin is also trusted. Without this check, any web page can
+    drive the victim's browser to issue requests to 127.0.0.1 (DNS rebinding /
+    localhost XSS); the TCP peer is loopback, so the request passes, and a
+    wildcard CORS config would let the page read the response (session tokens,
+    memories). Browsers always send the Origin header on cross-origin and
+    same-origin POST requests, so rejecting non-whitelisted Origins closes the
+    browser-driven bypass (MEM-01) without breaking CLI/curl callers (which
+    send no Origin).
+    """
+    origin = request.headers.get("origin")
+    if not origin or not isinstance(origin, str):
+        return True  # non-browser caller (CLI, curl, SDK) or mock/test request
+    from memanto.app.config import settings
+
+    origin_stripped = origin.rstrip("/")
+    allowed = [o.rstrip("/") for o in settings.ALLOWED_ORIGINS]
+    
+    if origin_stripped in allowed:
+        return True
+        
+    if settings.CORS_ORIGIN_REGEX:
+        import re
+        if re.match(settings.CORS_ORIGIN_REGEX, origin_stripped):
+            return True
+            
+    return False
+
+
+def _require_allowed_origin(request: Request) -> None:
+    """FastAPI dependency raising 403 for disallowed browser origins."""
+    if not _origin_is_allowed(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Origin not allowed for management endpoints",
+        )
 
 
 def _is_loopback_host(host: str | None) -> bool:
@@ -189,6 +231,11 @@ def require_management_access(
     if presented and expected and secrets.compare_digest(presented, expected):
         return server_key
 
+    # Reject browser-originated requests from non-whitelisted origins even when
+    # the TCP peer is loopback (MEM-01: DNS rebinding / localhost XSS lets any
+    # web page reach 127.0.0.1 and read admin responses under a wildcard CORS).
+    _require_allowed_origin(request)
+
     client_host = request.client.host if request.client else None
     if (
         _is_loopback_host(client_host)
@@ -226,12 +273,16 @@ def get_current_session(
     response: Response,
     x_session_token: str | None = Header(None),
     session_cookie: str | None = Cookie(None, alias=SESSION_COOKIE_NAME),
+    authorization: str | None = Header(None),
+    x_api_key: str | None = Header(None, alias="X-Api-Key"),
 ) -> Session:
     """
     Get and validate current session
 
     Args:
         x_session_token: Session token header
+        authorization: Bearer management credential (for auto-recreate)
+        x_api_key: Management credential header (for auto-recreate)
 
     Returns:
         Validated Session
@@ -244,6 +295,30 @@ def get_current_session(
         raise HTTPException(
             status_code=401, detail="Missing session token. Use X-Session-Token header."
         )
+
+    # A session presented via the HttpOnly *cookie* (browser transport) must
+    # come from the loopback interface targeting a loopback Host. The TCP
+    # client alone is not enough to trust: a DNS-rebinding page on an
+    # attacker domain can inherit the loopback client (the server sees a
+    # 127.0.0.1 peer) while the request's Host names the attacker origin.
+    # Mirror ``require_management_access``'s loopback boundary here so a
+    # rebinding page cannot read or write the memory store. Header-
+    # authenticated API clients (X-Session-Token) are unaffected and may be
+    # remote.
+    if session_cookie and not x_session_token:
+        client_host = request.client.host if request.client else None
+        if (
+            not _is_loopback_host(client_host)
+            or not _is_loopback_host_header(request.headers.get("host"))
+            or _is_cross_site_browser_request(request)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Cookie-authenticated session requests must originate "
+                    "from the loopback interface targeting a loopback Host."
+                ),
+            )
 
     session_service = get_session_service()
 
@@ -276,7 +351,64 @@ def get_current_session(
             if x_session_token:
                 response.headers["X-Session-Token"] = renewed.session_token
 
+        # Bind the session for activity logging: the memory services below
+        # only receive an agent_id and cannot tell which session a request
+        # belongs to.
+        set_memanto_session(session.session_id)
         return session
 
-    except (SessionExpiredError, SessionNotFoundError, InvalidSessionTokenError) as e:
+    except SessionExpiredError as e:
+        # The presented token belongs to a session that has fully lapsed.
+        # With SESSION_AUTO_RECREATE_ENABLED the caller gets a fresh session
+        # on this first operation — but only after passing the same
+        # management-access check as explicit activation (valid API key or
+        # loopback origin), so a stolen stale token alone is worthless.
+        recreated = _maybe_auto_recreate_session(
+            request=request,
+            response=response,
+            session_token=session_token,
+            x_session_token=x_session_token,
+            session_cookie=session_cookie,
+            authorization=authorization,
+            x_api_key=x_api_key,
+        )
+        if recreated is None:
+            raise map_error_to_http_exception(e)
+        return recreated
+
+    except (SessionNotFoundError, InvalidSessionTokenError) as e:
         raise map_error_to_http_exception(e)
+
+
+def _maybe_auto_recreate_session(
+    request: Request,
+    response: Response,
+    session_token: str,
+    x_session_token: str | None,
+    session_cookie: str | None,
+    authorization: str | None,
+    x_api_key: str | None,
+) -> Session | None:
+    """Attempt transparent recreation of an expired session.
+
+    Returns the fresh Session, or None when recreation does not apply
+    (disabled by config, terminated/logout session, superseded token) or is
+    not authorized — in which case the original expiry error surfaces.
+    """
+    try:
+        require_management_access(request, authorization, x_api_key)
+    except HTTPException:
+        return None
+
+    recreated = get_session_service().check_and_auto_recreate(session_token)
+    if recreated is None:
+        return None
+
+    # Mirror the auto-renewal handoff: refresh the browser cookie and/or
+    # return the replacement token so the next request authenticates.
+    if session_cookie:
+        set_session_cookie(response, recreated.session_token, request)
+    if x_session_token:
+        response.headers["X-Session-Token"] = recreated.session_token
+
+    return recreated
